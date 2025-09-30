@@ -1,4 +1,4 @@
-import os, io, json
+import os, io, json, time
 from typing import List, Tuple
 
 import numpy as np
@@ -42,19 +42,26 @@ def cosine_sim(a: np.ndarray, B: np.ndarray) -> np.ndarray:
 
 RUBRIC_PROMPT = """
 You are a structured hiring evaluator.
-Use ONLY the provided CV text as evidence. Do not invent facts.
+Use ONLY the provided CV text and role attributes as evidence. Do not invent facts.
+
 Score each dimension 0-5: skills, experience, seniority, domain, tenure.
+Also extract:
+- positive_evidence: short quotes or phrases showing alignment
+- negative_evidence: short quotes or notes showing gaps/risks
+
 Return a JSON object with:
 - scores {skills, experience, seniority, domain, tenure, constraints_pass}
-- evidence {skills[], experience[], seniority[], domain[], tenure[]}
+- evidence {positive[], negative[]}
 - notes []
-If constraints aren't obvious, set constraints_pass to true.
 """
 
-def score_with_llm(client: OpenAI, model: str, jd_text: str, cv_text: str) -> dict:
+def score_with_llm(client: OpenAI, model: str, jd_text: str, attributes: str, cv_text: str) -> dict:
     prompt = f"""
 Job description:
 {jd_text}
+
+Additional role attributes:
+{attributes}
 
 Candidate CV:
 {cv_text[:15000]}
@@ -76,7 +83,7 @@ Candidate CV:
                 "skills": 0, "experience": 0, "seniority": 0,
                 "domain": 0, "tenure": 0, "constraints_pass": True
             },
-            "evidence": {"skills": [], "experience": [], "seniority": [], "domain": [], "tenure": []},
+            "evidence": {"positive": [], "negative": []},
             "notes": ["LLM returned invalid JSON"]
         }
 
@@ -100,9 +107,12 @@ else:
     jd_file = st.file_uploader("Upload JD (.txt, .pdf, .docx)", type=["txt", "pdf", "docx"])
     if jd_file:
         jd_text = extract_text(jd_file)
-        st.text_area("JD preview (read-only)", jd_text[:5000], height=200, disabled=True)
+        st.text_area("JD preview", jd_text[:5000], height=200, disabled=True)
 
-st.subheader("2) Upload CVs (max 25)")
+st.subheader("2) Additional attributes")
+attributes = st.text_area("Enter extra attributes you want to check (comma or line separated)", height=100)
+
+st.subheader("3) Upload CVs (max 25)")
 cv_files = st.file_uploader("Upload CVs", type=["txt", "pdf", "docx"], accept_multiple_files=True)
 
 if st.button("Score candidates"):
@@ -118,34 +128,35 @@ if st.button("Score candidates"):
 
     client = OpenAI(api_key=api_key)
 
-    # Extract CVs
     records: List[Tuple[str, str]] = []
     for f in cv_files[:25]:
         f.seek(0)
         records.append((f.name, extract_text(f)))
 
-    # Embeddings shortlist
     jd_vec = embed_texts(client, emb_model, [jd_text])[0]
     cv_vecs = embed_texts(client, emb_model, [t for _, t in records])
     sims = cosine_sim(jd_vec, cv_vecs)
     order = np.argsort(-sims)[:shortlist_k]
     shortlist = [(records[i][0], records[i][1], float(sims[i])) for i in order]
 
-    # LLM scoring
     results = []
-    for fname, cv_text, emb_sim in shortlist:
-        judged = score_with_llm(client, llm_model, jd_text, cv_text)
+    total = len(shortlist)
+    prog = st.progress(0, text=f"Scoring {total} candidates...")
+    status = st.empty()
+    start_ts = time.time()
 
-        # Safe defaults so missing keys never crash
+    for i, (fname, cv_text, emb_sim) in enumerate(shortlist, start=1):
+        status.write(f"Scoring {i}/{total}: {fname}")
+        judged = score_with_llm(client, llm_model, jd_text, attributes, cv_text)
+
         defaults_scores = {
             "skills": 0, "experience": 0, "seniority": 0,
             "domain": 0, "tenure": 0, "constraints_pass": True
         }
         s = {**defaults_scores, **(judged.get("scores") or {})}
-
         ev = judged.get("evidence") or {}
-        ev_skills = "; ".join((ev.get("skills") or [])[:3])
-        ev_exp = "; ".join((ev.get("experience") or [])[:3])
+        pos = "; ".join((ev.get("positive") or [])[:3])
+        neg = "; ".join((ev.get("negative") or [])[:3])
 
         rubric = (
             0.35 * s["skills"] +
@@ -166,10 +177,19 @@ if st.button("Score candidates"):
             "tenure": s["tenure"],
             "constraints_pass": bool(s["constraints_pass"]),
             "final_score": round(final, 4),
-            "evidence_skills": ev_skills,
-            "evidence_experience": ev_exp,
+            "positive_evidence": pos,
+            "negative_evidence": neg,
             "notes": "; ".join(judged.get("notes", [])[:3])
         })
+
+        elapsed = time.time() - start_ts
+        avg_per = elapsed / i
+        remaining = total - i
+        eta_sec = int(avg_per * remaining)
+        prog.progress(i / total, text=f"Scored {i}/{total}. ETA ~{eta_sec}s")
+
+    status.write("Scoring complete")
+    prog.progress(1.0)
 
     df = pd.DataFrame(results).sort_values("final_score", ascending=False)
     st.subheader("Results")
