@@ -1,0 +1,18 @@
+# ===============================
+# File: requirements.txt
+# ===============================
+
+# Web UI
+streamlit>=1.37.0
+
+# OpenAI SDK
+openai>=1.40.0
+
+# Data + math
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0
+
+# Parsing
+pypdf>=4.2.0
+python-docx>=1.1.0
